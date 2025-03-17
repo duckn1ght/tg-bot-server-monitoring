@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/tls"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
@@ -23,6 +25,51 @@ type Bot struct {
 	config      *Config
 	api         *tgbotapi.BotAPI
 	activeChats sync.Map
+}
+
+const activeChatsFile = "active_chats.json"
+
+// saveActiveChats сохраняет активные чаты в JSON файл
+func (b *Bot) saveActiveChats() error {
+	chats := make([]int64, 0)
+	b.activeChats.Range(func(key, value interface{}) bool {
+		chats = append(chats, key.(int64))
+		return true
+	})
+
+	data, err := json.Marshal(chats)
+	if err != nil {
+		return fmt.Errorf("ошибка маршалинга чатов: %w", err)
+	}
+
+	if err := os.WriteFile(activeChatsFile, data, 0644); err != nil {
+		return fmt.Errorf("ошибка сохранения чатов: %w", err)
+	}
+
+	return nil
+}
+
+// loadActiveChats загружает активные чаты из JSON файла
+func (b *Bot) loadActiveChats() error {
+	data, err := os.ReadFile(activeChatsFile)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil // файл не существует, это нормально при первом запуске
+		}
+		return fmt.Errorf("ошибка чтения файла чатов: %w", err)
+	}
+
+	var chats []int64
+	if err := json.Unmarshal(data, &chats); err != nil {
+		return fmt.Errorf("ошибка анмаршалинга чатов: %w", err)
+	}
+
+	for _, chatID := range chats {
+		b.activeChats.Store(chatID, true)
+		log.Printf("Загружен активный чат: %d", chatID)
+	}
+
+	return nil
 }
 
 func loadConfig() (*Config, error) {
@@ -61,12 +108,18 @@ func (b *Bot) handleUpdates() {
 			msg := tgbotapi.NewMessage(chatID, "👋 Привет! Я буду отправлять уведомления о состоянии сервера в этот чат.")
 			b.api.Send(msg)
 			log.Printf("Новый чат активирован: %d", chatID)
+			if err := b.saveActiveChats(); err != nil {
+				log.Printf("Ошибка сохранения активных чатов: %v", err)
+			}
 
 		case "stop":
 			b.activeChats.Delete(chatID)
 			msg := tgbotapi.NewMessage(chatID, "Уведомления отключены. Чтобы включить их снова, используйте /start")
 			b.api.Send(msg)
 			log.Printf("Чат деактивирован: %d", chatID)
+			if err := b.saveActiveChats(); err != nil {
+				log.Printf("Ошибка сохранения активных чатов: %v", err)
+			}
 
 		case "status":
 			msg := tgbotapi.NewMessage(chatID, fmt.Sprintf("Мониторинг сервера %s\nИнтервал проверки: %v",
@@ -122,11 +175,21 @@ func main() {
 		api:    api,
 	}
 
+	// Загружаем сохраненные активные чаты
+	if err := bot.loadActiveChats(); err != nil {
+		log.Printf("Ошибка загрузки активных чатов: %v", err)
+	}
+
 	// Запускаем обработку команд в отдельной горутине
 	go bot.handleUpdates()
 
 	client := &http.Client{
 		Timeout: 10 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{
+				InsecureSkipVerify: true,
+			},
+		},
 	}
 
 	log.Printf("Бот запущен. Мониторинг сервера %s", config.serverURL)
