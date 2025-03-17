@@ -131,6 +131,9 @@ func (b *Bot) handleUpdates() {
 
 func (b *Bot) checkServer(client *http.Client) {
 	resp, err := client.Get(b.config.serverURL)
+	if err == nil {
+		defer resp.Body.Close()
+	}
 
 	var errorMsg string
 	if err != nil {
