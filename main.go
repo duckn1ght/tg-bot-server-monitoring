@@ -17,7 +17,8 @@ import (
 
 type Config struct {
 	botToken      string
-	serverURL     string
+	frontendURL   string
+	backendURL    string
 	checkInterval time.Duration
 }
 
@@ -84,7 +85,8 @@ func loadConfig() (*Config, error) {
 
 	return &Config{
 		botToken:      os.Getenv("TELEGRAM_BOT_TOKEN"),
-		serverURL:     os.Getenv("SERVER_URL"),
+		frontendURL:   os.Getenv("FRONTEND_URL"),
+		backendURL:    os.Getenv("BACKEND_URL"),
 		checkInterval: time.Duration(interval) * time.Millisecond,
 	}, nil
 }
@@ -105,7 +107,7 @@ func (b *Bot) handleUpdates() {
 		switch update.Message.Command() {
 		case "start":
 			b.activeChats.Store(chatID, true)
-			msg := tgbotapi.NewMessage(chatID, "👋 Привет! Я буду отправлять уведомления о состоянии сервера в этот чат.")
+			msg := tgbotapi.NewMessage(chatID, "👋 Привет! Я буду отправлять уведомления о состоянии серверов в этот чат.")
 			b.api.Send(msg)
 			log.Printf("Новый чат активирован: %d", chatID)
 			if err := b.saveActiveChats(); err != nil {
@@ -122,44 +124,71 @@ func (b *Bot) handleUpdates() {
 			}
 
 		case "status":
-			msg := tgbotapi.NewMessage(chatID, fmt.Sprintf("Мониторинг сервера %s\nИнтервал проверки: %v",
-				b.config.serverURL, b.config.checkInterval))
+			statusMsg := "📊 Статус мониторинга:\n\n"
+			if b.config.frontendURL != "" {
+				statusMsg += fmt.Sprintf("Frontend: %s\n", b.config.frontendURL)
+			}
+			if b.config.backendURL != "" {
+				statusMsg += fmt.Sprintf("Backend: %s\n", b.config.backendURL)
+			}
+			statusMsg += fmt.Sprintf("\nИнтервал проверки: %v", b.config.checkInterval)
+			
+			msg := tgbotapi.NewMessage(chatID, statusMsg)
 			b.api.Send(msg)
 		}
 	}
 }
 
 func (b *Bot) checkServer(client *http.Client) {
-	resp, err := client.Get(b.config.serverURL)
-	if err == nil {
-		defer resp.Body.Close()
-	}
+	// Проверяем frontend
+	frontendErr := b.checkURL(client, b.config.frontendURL, "Frontend")
+	// Проверяем backend
+	backendErr := b.checkURL(client, b.config.backendURL, "Backend")
 
-	var errorMsg string
-	if err != nil {
-		errorMsg = fmt.Sprintf("🚨 Ошибка сервера!\n\nURL: %s\nСообщение: %s\nВремя: %s",
-			b.config.serverURL, err.Error(), time.Now().Format(time.RFC3339))
-		log.Printf("Проверка сервера не удалась: %v", err)
-	} else if resp.StatusCode >= 400 {
-		errorMsg = fmt.Sprintf("🚨 Ошибка сервера!\n\nURL: %s\nСтатус: %d\nВремя: %s",
-			b.config.serverURL, resp.StatusCode, time.Now().Format(time.RFC3339))
-		log.Printf("Проверка сервера не удалась: статус %d", resp.StatusCode)
-	} else {
-		log.Printf("Проверка сервера: OK")
-		return
-	}
-
-	// Отправляем уведомления во все активные чаты
-	b.activeChats.Range(func(key, value interface{}) bool {
-		chatID := key.(int64)
-		msg := tgbotapi.NewMessage(chatID, errorMsg)
-		if _, err := b.api.Send(msg); err != nil {
-			log.Printf("Не удалось отправить уведомление в чат %d: %v", chatID, err)
-		} else {
-			log.Printf("Уведомление отправлено в чат %d", chatID)
+	// Если есть ошибки, отправляем уведомления
+	if frontendErr != nil || backendErr != nil {
+		errorMsg := "🚨 Обнаружены проблемы!\n\n"
+		if frontendErr != nil {
+			errorMsg += fmt.Sprintf("Frontend (%s):\n%s\n\n", b.config.frontendURL, frontendErr.Error())
 		}
-		return true
-	})
+		if backendErr != nil {
+			errorMsg += fmt.Sprintf("Backend (%s):\n%s\n\n", b.config.backendURL, backendErr.Error())
+		}
+		errorMsg += fmt.Sprintf("Время: %s", time.Now().Format(time.RFC3339))
+
+		// Отправляем уведомления во все активные чаты
+		b.activeChats.Range(func(key, value interface{}) bool {
+			chatID := key.(int64)
+			msg := tgbotapi.NewMessage(chatID, errorMsg)
+			if _, err := b.api.Send(msg); err != nil {
+				log.Printf("Не удалось отправить уведомление в чат %d: %v", chatID, err)
+			} else {
+				log.Printf("Уведомление отправлено в чат %d", chatID)
+			}
+			return true
+		})
+	}
+}
+
+func (b *Bot) checkURL(client *http.Client, url string, serviceName string) error {
+	if url == "" {
+		return nil // Пропускаем проверку, если URL не задан
+	}
+
+	resp, err := client.Get(url)
+	if err != nil {
+		log.Printf("Проверка %s не удалась: %v", serviceName, err)
+		return fmt.Errorf("Ошибка соединения: %s", err.Error())
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		log.Printf("Проверка %s не удалась: статус %d", serviceName, resp.StatusCode)
+		return fmt.Errorf("Статус: %d", resp.StatusCode)
+	}
+
+	log.Printf("Проверка %s: OK", serviceName)
+	return nil
 }
 
 func main() {
@@ -195,7 +224,13 @@ func main() {
 		},
 	}
 
-	log.Printf("Бот запущен. Мониторинг сервера %s", config.serverURL)
+	log.Printf("Бот запущен. Мониторинг серверов:")
+	if config.frontendURL != "" {
+		log.Printf("Frontend: %s", config.frontendURL)
+	}
+	if config.backendURL != "" {
+		log.Printf("Backend: %s", config.backendURL)
+	}
 	log.Printf("Интервал проверки: %v", config.checkInterval)
 
 	// Регулярные проверки
