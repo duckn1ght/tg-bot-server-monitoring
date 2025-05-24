@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
@@ -8,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -16,10 +18,12 @@ import (
 )
 
 type Config struct {
-	botToken      string
-	frontendURL   string
-	backendURL    string
-	checkInterval time.Duration
+	botToken         string
+	frontendURL      string
+	backendURL       string
+	checkInterval    time.Duration
+	frontendLogsPath string
+	backendLogsPath  string
 }
 
 type Bot struct {
@@ -84,10 +88,12 @@ func loadConfig() (*Config, error) {
 	}
 
 	return &Config{
-		botToken:      os.Getenv("TELEGRAM_BOT_TOKEN"),
-		frontendURL:   os.Getenv("FRONTEND_URL"),
-		backendURL:    os.Getenv("BACKEND_URL"),
-		checkInterval: time.Duration(interval) * time.Millisecond,
+		botToken:         os.Getenv("TELEGRAM_BOT_TOKEN"),
+		frontendURL:      os.Getenv("FRONTEND_URL"),
+		backendURL:       os.Getenv("BACKEND_URL"),
+		checkInterval:    time.Duration(interval) * time.Millisecond,
+		frontendLogsPath: os.Getenv("FRONTEND_LOGS_PATH"),
+		backendLogsPath:  os.Getenv("BACKEND_LOGS_PATH"),
 	}, nil
 }
 
@@ -107,7 +113,7 @@ func (b *Bot) handleUpdates() {
 		switch update.Message.Command() {
 		case "start":
 			b.activeChats.Store(chatID, true)
-			msg := tgbotapi.NewMessage(chatID, "👋 Привет! Я буду отправлять уведомления о состоянии серверов в этот чат.")
+			msg := tgbotapi.NewMessage(chatID, "👋 Привет! Я буду отправлять уведомления о состоянии серверов в этот чат. Для подробностей используйте команду /status")
 			b.api.Send(msg)
 			log.Printf("Новый чат активирован: %d", chatID)
 			if err := b.saveActiveChats(); err != nil {
@@ -126,45 +132,150 @@ func (b *Bot) handleUpdates() {
 		case "status":
 			statusMsg := "📊 Статус мониторинга:\n\n"
 			if b.config.frontendURL != "" {
-				statusMsg += fmt.Sprintf("Frontend: %s\n", b.config.frontendURL)
+				statusMsg += fmt.Sprintf("Клиентская часть: %s\n", b.config.frontendURL)
 			}
 			if b.config.backendURL != "" {
-				statusMsg += fmt.Sprintf("Backend: %s\n", b.config.backendURL)
+				statusMsg += fmt.Sprintf("Серверная часть: %s\n", b.config.backendURL)
 			}
 			statusMsg += fmt.Sprintf("\nИнтервал проверки: %v", b.config.checkInterval)
-			
+
 			msg := tgbotapi.NewMessage(chatID, statusMsg)
 			b.api.Send(msg)
 		}
 	}
 }
 
+func getLastLines(path string, n int) (string, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+
+	var lines []string
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		lines = append(lines, scanner.Text())
+	}
+	if err := scanner.Err(); err != nil {
+		return "", err
+	}
+
+	if len(lines) > n {
+		lines = lines[len(lines)-n:]
+	}
+	// Формируем цитату для HTML
+	quote := "<blockquote>\n" + htmlEscapeLines(lines) + "\n</blockquote>"
+	return quote, nil
+}
+
+// htmlEscapeLines экранирует спецсимволы для HTML и объединяет строки
+func htmlEscapeLines(lines []string) string {
+	result := ""
+	for _, line := range lines {
+		result += fmt.Sprintf("%s\n", htmlEscape(line))
+	}
+	return result
+}
+
+// htmlEscape экранирует спецсимволы для HTML
+func htmlEscape(s string) string {
+	replacer := strings.NewReplacer(
+		"&", "&amp;",
+		"<", "&lt;",
+		">", "&gt;",
+	)
+	return replacer.Replace(s)
+}
+
 func (b *Bot) checkServer(client *http.Client) {
-	// Проверяем frontend
 	frontendErr := b.checkURL(client, b.config.frontendURL, "Frontend")
-	// Проверяем backend
 	backendErr := b.checkURL(client, b.config.backendURL, "Backend")
 
-	// Если есть ошибки, отправляем уведомления
 	if frontendErr != nil || backendErr != nil {
-		errorMsg := "🚨 Обнаружены проблемы!\n\n"
+		sendFrontendLog := false
+		sendBackendLog := false
+		frontendCaption := ""
+		backendCaption := ""
+
 		if frontendErr != nil {
-			errorMsg += fmt.Sprintf("Frontend (%s):\n%s\n\n", b.config.frontendURL, frontendErr.Error())
+			frontendCaption = fmt.Sprintf(
+				"🚨 <b>Обнаружена проблема!</b>\nОшибка клиентской стороны (<a href=\"%s\">ссылка</a>)\n\n<blockquote>%s</blockquote>\n\n<i>Время: %s</i>",
+				b.config.frontendURL, frontendErr.Error(), time.Now().Format("15:04 02/01/2006"),
+			)
+			sendFrontendLog = true
 		}
 		if backendErr != nil {
-			errorMsg += fmt.Sprintf("Backend (%s):\n%s\n\n", b.config.backendURL, backendErr.Error())
+			backendCaption = fmt.Sprintf(
+				"🚨 <b>Обнаружена проблема!</b>\nОшибка серверной стороны (<a href=\"%s\">ссылка</a>)\n\n<blockquote>%s</blockquote>\n\n<i>Время: %s</i>",
+				b.config.backendURL, backendErr.Error(), time.Now().Format("15:04 02/01/2006"),
+			)
+			sendBackendLog = true
 		}
-		errorMsg += fmt.Sprintf("Время: %s", time.Now().Format(time.RFC3339))
 
-		// Отправляем уведомления во все активные чаты
 		b.activeChats.Range(func(key, value interface{}) bool {
 			chatID := key.(int64)
-			msg := tgbotapi.NewMessage(chatID, errorMsg)
-			if _, err := b.api.Send(msg); err != nil {
-				log.Printf("Не удалось отправить уведомление в чат %d: %v", chatID, err)
-			} else {
-				log.Printf("Уведомление отправлено в чат %d", chatID)
+
+			// FRONTEND
+			if sendFrontendLog {
+				caption := frontendCaption
+				if b.config.frontendLogsPath != "" {
+					if _, err := os.Stat(b.config.frontendLogsPath); err == nil {
+						if lastLines, err := getLastLines(b.config.frontendLogsPath, 10); err == nil {
+							caption += "\n\nПоследние 10 строк лога:\n" + lastLines
+						}
+						doc := tgbotapi.NewDocument(chatID, tgbotapi.FilePath(b.config.frontendLogsPath))
+						doc.Caption = caption
+						doc.ParseMode = "HTML"
+						if _, err := b.api.Send(doc); err != nil {
+							log.Printf("Не удалось отправить frontend логи в чат %d: %v", chatID, err)
+						}
+					} else {
+						msg := tgbotapi.NewMessage(chatID, caption)
+						msg.ParseMode = "HTML"
+						if _, err := b.api.Send(msg); err != nil {
+							log.Printf("Не удалось отправить frontend ошибку в чат %d: %v", chatID, err)
+						}
+					}
+				} else {
+					msg := tgbotapi.NewMessage(chatID, caption)
+					msg.ParseMode = "HTML"
+					if _, err := b.api.Send(msg); err != nil {
+						log.Printf("Не удалось отправить frontend ошибку в чат %d: %v", chatID, err)
+					}
+				}
 			}
+
+			// BACKEND
+			if sendBackendLog {
+				caption := backendCaption
+				if b.config.backendLogsPath != "" {
+					if _, err := os.Stat(b.config.backendLogsPath); err == nil {
+						if lastLines, err := getLastLines(b.config.backendLogsPath, 10); err == nil {
+							caption += "\n\nПоследние 10 строк лога:\n" + lastLines
+						}
+						doc := tgbotapi.NewDocument(chatID, tgbotapi.FilePath(b.config.backendLogsPath))
+						doc.Caption = caption
+						doc.ParseMode = "HTML"
+						if _, err := b.api.Send(doc); err != nil {
+							log.Printf("Не удалось отправить backend логи в чат %d: %v", chatID, err)
+						}
+					} else {
+						msg := tgbotapi.NewMessage(chatID, caption)
+						msg.ParseMode = "HTML"
+						if _, err := b.api.Send(msg); err != nil {
+							log.Printf("Не удалось отправить backend ошибку в чат %d: %v", chatID, err)
+						}
+					}
+				} else {
+					msg := tgbotapi.NewMessage(chatID, caption)
+					msg.ParseMode = "HTML"
+					if _, err := b.api.Send(msg); err != nil {
+						log.Printf("Не удалось отправить backend ошибку в чат %d: %v", chatID, err)
+					}
+				}
+			}
+
 			return true
 		})
 	}
@@ -178,13 +289,13 @@ func (b *Bot) checkURL(client *http.Client, url string, serviceName string) erro
 	resp, err := client.Get(url)
 	if err != nil {
 		log.Printf("Проверка %s не удалась: %v", serviceName, err)
-		return fmt.Errorf("Ошибка соединения: %s", err.Error())
+		return fmt.Errorf("%s", err.Error())
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 400 {
 		log.Printf("Проверка %s не удалась: статус %d", serviceName, resp.StatusCode)
-		return fmt.Errorf("Статус: %d", resp.StatusCode)
+		return fmt.Errorf("cтатус: %d", resp.StatusCode)
 	}
 
 	log.Printf("Проверка %s: OK", serviceName)

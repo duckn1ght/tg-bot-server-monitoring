@@ -1,3 +1,4 @@
 /.env
 active_chats.json
 output.log
+logs
